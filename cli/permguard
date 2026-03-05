@@ -1,0 +1,605 @@
+#!/bin/bash
+#
+# permguard - Fleet Script Permission Auditor & Enforcer
+# Day 4 of 100 Days of DevOps
+# Author: Saharsh Pamecha (Staff Engineer)
+# License: MIT
+#
+# Addresses permission drift in automation scripts across Linux fleets.
+# Supports OpenClaw AI agent script hardening.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+REPORT_DIR="/tmp/permguard-reports"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+# Default paths to scan
+DEFAULT_SCAN_PATHS="/opt /home /usr/local/bin /scripts /usr/bin /bin"
+
+# Check root for enforce
+check_root() {
+    if [[ $EUID -ne 0 ]] && [[ "${1:-}" == "enforce" || "${1:-}" == "fix" ]]; then
+        echo -e "${RED}✗ Error: enforce/fix commands require root privileges${NC}"
+        echo -e "${YELLOW}→ Run with: sudo permguard $1${NC}"
+        exit 1
+    fi
+}
+
+# Parse permission string to numeric
+perm_to_num() {
+    local perm="$1"
+    local num=0
+    
+    [[ "$perm" =~ r ]] && ((num+=4))
+    [[ "$perm" =~ w ]] && ((num+=2))
+    [[ "$perm" =~ x ]] && ((num+=1))
+    
+    echo "$num"
+}
+
+# Get file type description
+get_file_type() {
+    local file="$1"
+    
+    if [[ -L "$file" ]]; then
+        echo "symlink"
+    elif [[ -d "$file" ]]; then
+        echo "directory"
+    elif [[ "$file" == *.sh ]]; then
+        echo "shell-script"
+    elif [[ "$file" == *.py ]]; then
+        echo "python-script"
+    elif [[ "$file" == *.rb ]]; then
+        echo "ruby-script"
+    elif [[ "$file" == *.pl ]]; then
+        echo "perl-script"
+    elif [[ "$file" == *.js ]]; then
+        echo "javascript"
+    elif [[ "$file" == *.conf ]] || [[ "$file" == *.cfg ]]; then
+        echo "config"
+    elif [[ -x "$file" ]]; then
+        echo "executable"
+    else
+        echo "regular-file"
+    fi
+}
+
+# Suggest correct permissions based on file type
+suggest_perms() {
+    local file="$1"
+    local type=$(get_file_type "$file")
+    
+    case "$type" in
+        shell-script|python-script|ruby-script|perl-script|executable)
+            echo "755"
+            ;;
+        config)
+            echo "644"
+            ;;
+        directory)
+            echo "755"
+            ;;
+        *)
+            echo "644"
+            ;;
+    esac
+}
+
+# Check if permission is problematic
+check_permission_issue() {
+    local perms="$1"
+    local owner=$(perm_to_num "${perms:1:3}")
+    local group=$(perm_to_num "${perms:4:3}")
+    local others=$(perm_to_num "${perms:7:3}")
+    
+    # Check for dangerous 777
+    if [[ $others -eq 7 ]]; then
+        echo "dangerous_777"
+        return
+    fi
+    
+    # Check for missing execute on scripts
+    if [[ "$perms" == "----------" ]]; then
+        echo "no_permissions"
+        return
+    fi
+    
+    # Check for world-writable
+    if [[ $others -ge 6 ]]; then
+        echo "world_writable"
+        return
+    fi
+    
+    echo "ok"
+}
+
+# Scan command
+scan() {
+    local scan_path="${1:-$DEFAULT_SCAN_PATHS}"
+    local output_json="${2:-}"
+    
+    echo ""
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}  PERMGUARD SCAN REPORT${NC}"
+    echo -e "${MAGENTA}  $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    echo -e "${BLUE}Scanning:${NC} $scan_path"
+    echo -e "${BLUE}Server:${NC} $(hostname)"
+    echo ""
+    
+    local total_files=0
+    local issues_found=0
+    local dangerous=0
+    local missing_exec=0
+    local world_writable=0
+    
+    # Find all executable files and scripts
+    local files=$(find $scan_path -type f \( -name "*.sh" -o -name "*.py" -o -name "*.rb" -o -name "*.pl" -o -executable \) 2>/dev/null || true)
+    
+    echo -e "${MAGENTA}┌─ Permission Analysis ────────────────────────────────────────┐${NC}"
+    echo ""
+    
+    for file in $files; do
+        ((total_files++))
+        
+        local perms=$(stat -c "%a" "$file" 2>/dev/null || stat -f "%OLp" "$file" 2>/dev/null)
+        local owner_perms="${perms:0:1}"
+        local group_perms="${perms:1:1}"
+        local others_perms="${perms:2:1}"
+        
+        local owner_num=$(perm_to_num "$owner_perms")
+        local group_num=$(perm_to_num "$group_perms")
+        local others_num=$(perm_to_num "$others_perms")
+        
+        local issue=$(check_permission_issue "$(stat -c "%A" "$file" 2>/dev/null)")
+        
+        if [[ "$issue" != "ok" ]]; then
+            ((issues_found++))
+            
+            case "$issue" in
+                dangerous_777)
+                    ((dangerous++))
+                    echo -e "  ${RED}✗${NC} ${file}"
+                    echo -e "      ${RED}DANGER: 777 permissions!${NC} (owner=$owner_num group=$group_num others=$others_num)"
+                    ;;
+                no_permissions)
+                    ((missing_exec++))
+                    echo -e "  ${YELLOW}!${NC} ${file}"
+                    echo -e "      ${YELLOW}MISSING: No permissions (000)${NC}"
+                    ;;
+                world_writable)
+                    ((world_writable++))
+                    echo -e "  ${YELLOW}!${NC} ${file}"
+                    echo -e "      ${YELLOW}WARN: World-writable (others=$others_num)${NC}"
+                    ;;
+            esac
+            
+            local suggested=$(suggest_perms "$file")
+            echo -e "      → Suggested: $suggested (owner=rwx, group/others=rx)"
+        fi
+    done
+    
+    echo ""
+    echo -e "${MAGENTA}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    # Summary
+    echo -e "${MAGENTA}┌─ Summary ────────────────────────────────────────────────────┐${NC}"
+    echo ""
+    echo -e "  ${BLUE}Total scripts found:${NC} $total_files"
+    echo -e "  ${BLUE}Files with issues:${NC} $issues_found"
+    echo ""
+    
+    if [[ $issues_found -eq 0 ]]; then
+        echo -e "  ${GREEN}✓ All permissions look good!${NC}"
+    else
+        echo -e "  ${RED}Dangerous (777):${NC} $dangerous"
+        echo -e "  ${YELLOW}Missing exec (000):${NC} $missing_exec"
+        echo -e "  ${YELLOW}World-writable:${NC} $world_writable"
+    fi
+    
+    echo ""
+    echo -e "${MAGENTA}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    # OpenClaw AI Agent section
+    echo -e "${CYAN}┌─ OpenClaw AI Agent Scripts ─────────────────────────────────┐${NC}"
+    echo ""
+    
+    local openclaw_scripts=$(find $scan_path -type f \( -path "*openclaw*" -o -path "*skills*" -o -path "*agents*" \) \( -name "*.sh" -o -name "*.py" \) 2>/dev/null || true)
+    local openclaw_count=$(echo "$openclaw_scripts" | wc -w)
+    
+    if [[ $openclaw_count -gt 0 ]]; then
+        echo -e "  ${GREEN}✓${NC} Found $openclaw_count OpenClaw-related scripts"
+        for script in $openclaw_scripts; do
+            local perms=$(stat -c "%a" "$script" 2>/dev/null)
+            if [[ "$perms" != "755" && "$perms" != "700" ]]; then
+                echo -e "      ${YELLOW}!${NC} $script (perms: $perms)"
+            fi
+        done
+    else
+        echo -e "  ${YELLOW}!${NC} No OpenClaw scripts found in scan path"
+        echo -e "      ${YELLOW}Tip: OpenClaw skills are typically in /opt/openclaw/skills or ~/openclaw${NC}"
+    fi
+    
+    echo ""
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    return 0
+}
+
+# Enforce command - fix permissions
+enforce() {
+    check_root "enforce"
+    local scan_path="${1:-$DEFAULT_SCAN_PATHS}"
+    local dry_run="${2:-}"
+    
+    echo ""
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}  PERMGUARD ENFORCE${NC}"
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if [[ "$dry_run" == "--dry-run" || "$dry_run" == "-n" ]]; then
+        echo -e "${YELLOW}⚠ DRY RUN MODE - No changes will be made${NC}"
+        echo ""
+    fi
+    
+    local files=$(find $scan_path -type f \( -name "*.sh" -o -name "*.py" -o -name "*.rb" -o -name "*.pl" -o -executable \) 2>/dev/null || true)
+    local fixed=0
+    local skipped=0
+    
+    for file in $files; do
+        local current_perms=$(stat -c "%a" "$file" 2>/dev/null || stat -f "%OLp" "$file" 2>/dev/null)
+        local suggested=$(suggest_perms "$file")
+        local issue=$(check_permission_issue "$(stat -c "%A" "$file" 2>/dev/null)")
+        
+        if [[ "$issue" != "ok" ]]; then
+            if [[ "$dry_run" != "--dry-run" && "$dry_run" != "-n" ]]; then
+                chmod "$suggested" "$file"
+                echo -e "  ${GREEN}✓${NC} Fixed: $file ($current_perms → $suggested)"
+                ((fixed++))
+            else
+                echo -e "  ${YELLOW}→${NC} Would fix: $file ($current_perms → $suggested)"
+                ((fixed++))
+            fi
+        else
+            ((skipped++))
+        fi
+    done
+    
+    echo ""
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${GREEN}✓${NC} Processed: $fixed fixed, $skipped OK"
+    
+    if [[ "$dry_run" != "--dry-run" && "$dry_run" != "-n" ]]; then
+        echo -e "${GREEN}✓${NC} Run 'permguard report' to generate audit evidence"
+    else
+        echo -e "${YELLOW}Run without --dry-run to apply changes${NC}"
+    fi
+    echo ""
+}
+
+# Report command - generate HTML report
+report() {
+    local scan_path="${1:-$DEFAULT_SCAN_PATHS}"
+    
+    mkdir -p "$REPORT_DIR"
+    local report_file="${REPORT_DIR}/permguard-report-$(date +%Y%m%d-%H%M%S).html"
+    local hostname=$(hostname)
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Gather data
+    local files=$(find $scan_path -type f \( -name "*.sh" -o -name "*.py" -o -name "*.rb" -o -name "*.pl" -o -executable \) 2>/dev/null || true)
+    local total_files=$(echo "$files" | wc -w)
+    
+    local issues_json="[]"
+    local dangerous=0
+    local missing_exec=0
+    local world_writable=0
+    
+    for file in $files; do
+        local perms=$(stat -c "%a" "$file" 2>/dev/null)
+        local issue=$(check_permission_issue "$(stat -c "%A" "$file" 2>/dev/null)")
+        
+        if [[ "$issue" != "ok" ]]; then
+            case "$issue" in
+                dangerous_777) ((dangerous++)) ;;
+                no_permissions) ((missing_exec++)) ;;
+                world_writable) ((world_writable++)) ;;
+            esac
+        fi
+    done
+    
+    local total_issues=$((dangerous + missing_exec + world_writable))
+    
+    # Calculate score
+    if [[ $total_files -gt 0 ]]; then
+        local score=$(( (total_files - total_issues) * 100 / total_files ))
+    else
+        local score=100
+    fi
+    
+    # Determine grade
+    if [[ $score -eq 100 ]]; then
+        grade="A+"
+        grade_color="#10b981"
+        status="Fully Compliant"
+    elif [[ $score -ge 80 ]]; then
+        grade="A"
+        grade_color="#10b981"
+        status="Excellent"
+    elif [[ $score -ge 60 ]]; then
+        grade="B"
+        grade_color="#f59e0b"
+        status="Needs Attention"
+    else
+        grade="D"
+        grade_color="#ef4444"
+        status="Critical Issues"
+    fi
+    
+    cat > "$report_file" << EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PermGuard - Permission Audit Report</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: #e8e8e8;
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header { text-align: center; margin-bottom: 40px; }
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #e94560 0%, #ff6b6b 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+        .header p { color: #a0a0a0; font-size: 1.1rem; }
+        .meta-card {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        .meta-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        .meta-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #888;
+            margin-bottom: 4px;
+        }
+        .meta-value { font-size: 0.95rem; color: #f0f0f0; font-weight: 500; }
+        .score-card {
+            background: linear-gradient(135deg, rgba(233,69,96,0.1) 0%, rgba(255,107,107,0.1) 100%);
+            border: 1px solid rgba(233,69,96,0.2);
+            border-radius: 16px;
+            padding: 32px;
+            text-align: center;
+            margin-bottom: 24px;
+        }
+        .score-value { font-size: 4rem; font-weight: 700; color: ${grade_color}; line-height: 1; }
+        .score-label { font-size: 1.25rem; color: #f0f0f0; margin: 8px 0; }
+        .score-status { font-size: 1rem; color: ${grade_color}; }
+        .section {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        .section h2 {
+            font-size: 1.25rem;
+            color: #e94560;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .stat-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            text-align: center;
+        }
+        .stat-box {
+            background: rgba(0,0,0,0.2);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .stat-number { font-size: 2rem; font-weight: 700; }
+        .stat-label { font-size: 0.875rem; color: #888; margin-top: 4px; }
+        .danger { color: #ef4444; }
+        .warning { color: #f59e0b; }
+        .success { color: #10b981; }
+        .footer {
+            text-align: center;
+            color: #666;
+            font-size: 0.875rem;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        .footer a { color: #e94560; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>PermGuard</h1>
+            <p>Script Permission Audit Report</p>
+        </div>
+        
+        <div class="meta-card">
+            <div class="meta-grid">
+                <div>
+                    <div class="meta-label">Server</div>
+                    <div class="meta-value">${hostname}</div>
+                </div>
+                <div>
+                    <div class="meta-label">Generated</div>
+                    <div class="meta-value">${timestamp}</div>
+                </div>
+                <div>
+                    <div class="meta-label">Scan Path</div>
+                    <div class="meta-value">${scan_path}</div>
+                </div>
+                <div>
+                    <div class="meta-label">Tool Version</div>
+                    <div class="meta-value">${VERSION}</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="score-card">
+            <div class="score-value">${score}%</div>
+            <div class="score-label">Security Grade: ${grade}</div>
+            <div class="score-status">${status}</div>
+        </div>
+        
+        <div class="section">
+            <h2>📊 Permission Statistics</h2>
+            <div class="stat-grid">
+                <div class="stat-box">
+                    <div class="stat-number danger">${dangerous}</div>
+                    <div class="stat-label">Dangerous (777)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number warning">${missing_exec}</div>
+                    <div class="stat-label">Missing (000)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number warning">${world_writable}</div>
+                    <div class="stat-label">World-Writable</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>🔒 CIS Benchmark Alignment</h2>
+            <p style="color: #a0a0a0; line-height: 1.6;">
+                Proper file permissions follow the Principle of Least Privilege (CIS 6.1, 6.2).
+                Scripts should use 755 for executables, 644 for configs. Never use 777.
+                This prevents unauthorized modification and ensures safe automation execution.
+            </p>
+        </div>
+        
+        <div class="footer">
+            <p>Generated by <strong>permguard</strong> — Day 4 of 100 Days of DevOps</p>
+            <p>Built by <a href="https://github.com/SaharshPamecha">Saharsh Pamecha</a> • MIT License</p>
+        </div>
+    </div>
+</body>
+</html>
+EOF
+
+    echo ""
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}  REPORT GENERATED${NC}"
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${GREEN}✓${NC} Report saved: ${BLUE}${report_file}${NC}"
+    echo ""
+    echo -e "${YELLOW}To view:${NC}"
+    echo -e "  ${BLUE}# On local machine${NC}"
+    echo -e "  scp ${hostname}:${report_file} ./"
+    echo -e "  open permguard-report-*.html"
+    echo ""
+}
+
+# Show help
+show_help() {
+    echo ""
+    echo -e "${MAGENTA}permguard${NC} — Fleet Script Permission Auditor & Enforcer"
+    echo -e "${MAGENTA}Version:${NC} $VERSION"
+    echo ""
+    echo -e "${BLUE}USAGE:${NC}"
+    echo "  permguard [command] [options]"
+    echo ""
+    echo -e "${BLUE}COMMANDS:${NC}"
+    echo "  scan [path]     Scan for permission issues (default: /opt /home /usr/local/bin)"
+    echo "  enforce [path]  Fix permissions (requires root, safe 755/644 defaults)"
+    echo "  report [path]   Generate HTML compliance report"
+    echo "  help            Show this help message"
+    echo ""
+    echo -e "${BLUE}OPTIONS:${NC}"
+    echo "  --dry-run       Show what would be changed without making changes"
+    echo ""
+    echo -e "${BLUE}EXAMPLES:${NC}"
+    echo "  # Scan default paths"
+    echo "  permguard scan"
+    echo ""
+    echo "  # Scan specific directory"
+    echo "  permguard scan /opt/scripts"
+    echo ""
+    echo "  # Dry run before enforcing"
+    echo "  sudo permguard enforce /opt --dry-run"
+    echo ""
+    echo "  # Apply fixes"
+    echo "  sudo permguard enforce /opt"
+    echo ""
+    echo "  # Generate report"
+    echo "  permguard report /opt"
+    echo ""
+    echo -e "${BLUE}FEATURES:${NC}"
+    echo "  • Detects dangerous 777 permissions"
+    echo "  • Finds scripts missing execute bit (000)"
+    echo "  • Identifies world-writable files"
+    echo "  • OpenClaw AI agent script detection"
+    echo "  • Safe 755/644 defaults based on file type"
+    echo "  • HTML compliance reports for auditors"
+    echo ""
+    echo -e "${MAGENTA}Day 4 of 100 Days of DevOps${NC}"
+    echo -e "${MAGENTA}Built by Saharsh Pamecha • MIT License${NC}"
+    echo ""
+}
+
+# Main
+case "${1:-help}" in
+    scan)
+        scan "${2:-}" "${3:-}"
+        ;;
+    enforce|fix)
+        enforce "${2:-}" "${3:-}"
+        ;;
+    report)
+        report "${2:-}"
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        echo -e "${RED}✗ Unknown command: $1${NC}"
+        show_help
+        exit 1
+        ;;
+esac
