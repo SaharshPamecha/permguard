@@ -1,0 +1,55 @@
+Tweet 1/5
+───
+Day 4/100 of building open-source DevOps tools:
+
+Permission drift kills automation. Scripts lose execute bits during rsync, Git pulls, Docker mounts, Ansible copy...
+
+Suddenly your cron jobs fail, CI breaks, and AI agents like OpenClaw won't run.
+
+I built permguard to fix this.
+
+🧵
+
+Tweet 2/5
+───
+permguard: Fleet script permission auditor & enforcer
+
+→ scan — Detect dangerous 777, missing 000, world-writable
+→ enforce — Fix with safe 755/644 defaults
+→ report — HTML compliance for auditors
+
+Zero dependencies. Dry-run available.
+
+Tweet 3/5
+───
+What it detects:
+
+✗ 777 permissions — anyone can modify execute code
+✗ 000 permissions — script can't run at all  
+✗ World-writable — unauthorized modification
+
+Smart defaults: 755 for scripts, 644 for configs. Principle of least privilege.
+
+Tweet 4/5
+───
+OpenClaw AI Agent support built-in:
+
+Detects scripts in /opt/openclaw/skills, ~/openclaw/skills
+Ensures your AI automation runs with correct permissions.
+
+Interactive demo: https://permguard.vercel.app
+Source: https://github.com/SaharshPamecha/permguard
+
+Tweet 5/5
+───
+Day 4 done. 4/100 ✅
+
+Four tools now:
+Day 1: userctl (service accounts)
+Day 2: expiry-guard (temp users)
+Day 3: ssh-shield (SSH hardening)
+Day 4: permguard (script permissions)
+
+Linux Security Toolkit forming. More coming daily.
+
+#100DaysOfDevOps #DevOps #Linux #Security #Permissions

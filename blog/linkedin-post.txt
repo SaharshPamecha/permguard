@@ -1,0 +1,20 @@
+Day 4/100: Permission drift is killing your automation ✅
+
+Scripts lose execute bits during rsync, Git pulls, Docker mounts, Ansible copy operations. Suddenly cron jobs fail, CI breaks, and AI agents like OpenClaw won't run.
+
+Built permguard — fleet script permission auditor & enforcer:
+
+→ scan — Detect dangerous 777, missing 000, world-writable files
+→ enforce — Fix with safe 755/644 defaults (dry-run available)
+→ report — HTML compliance reports for auditors
+
+Zero dependencies. OpenClaw AI agent support built-in. CIS 6.1/6.2 aligned.
+
+Real problem solved: Permission drift across 200+ servers without manual chmod or dangerous 777 over-permissioning.
+
+Interactive demo: https://permguard.vercel.app
+Source code: https://github.com/SaharshPamecha/permguard
+
+This is part of my 100-day open-source DevOps journey. Follow along for daily tools.
+
+#DevOps #Linux #Security #Permissions #CIS #Automation #OpenSource #100DaysOfDevOps
